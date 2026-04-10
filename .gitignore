@@ -1,1 +1,6 @@
 results_loso/
+results/
+results_loso_limited/
+runs/
+model/
+__pycache__/

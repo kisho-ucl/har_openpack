@@ -283,3 +283,136 @@ class TaskClassifier_Linear(nn.Module):
         x = self.encoder(x)
         logits = self.classifier(x)
         return logits, x, x
+
+class TaskClassifier_DCL(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        feature_dim,
+        lstm_hidden,
+        num_layers,
+        num_classes,
+        dropout=0.3,
+    ):
+        super().__init__()
+
+        # ===== CNN (time dimension is kept) =====
+        self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=10, stride=4, padding=3)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=6, stride=2, padding=2)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+
+        self.conv3 = nn.Conv1d(hidden_dim, feature_dim, kernel_size=4, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm1d(feature_dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+        # ===== LSTM =====
+        self.lstm = nn.LSTM(
+            input_size=feature_dim,
+            hidden_size=lstm_hidden,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        # ===== Classifier =====
+        self.classifier = nn.Linear(lstm_hidden, num_classes)
+
+    def forward(self, x):
+        """
+        x: (B, C, T)
+        """
+
+        # --- CNN ---
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.dropout(x)
+        # x: (B, F, T')
+
+        # --- LSTM expects (B, T', F) ---
+        x = x.permute(0, 2, 1)
+
+        # --- LSTM ---
+        out, (h_n, _) = self.lstm(x)
+        # h_n: (num_layers, B, lstm_hidden)
+
+        # --- use last layer, last timestep ---
+        h_last = h_n[-1]        # (B, lstm_hidden)
+
+        logits = self.classifier(h_last)
+        return logits, h_last, h_last
+
+class TaskClassifier_DCT(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        feature_dim,
+        num_heads,
+        num_layers,
+        num_classes,
+        dropout=0.3,
+    ):
+        super().__init__()
+
+        # ===== CNN (same as DCL) =====
+        self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=10, stride=4, padding=3)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=6, stride=2, padding=2)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+
+        self.conv3 = nn.Conv1d(hidden_dim, feature_dim, kernel_size=4, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm1d(feature_dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+        # ===== Transformer =====
+        self.cls_token = nn.Parameter(torch.randn(1, 1, feature_dim))
+        self.pos = PositionalEncoding(feature_dim, 500)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=feature_dim,
+            nhead=num_heads,
+            dim_feedforward=feature_dim * 2,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers)
+
+        # ===== Classifier =====
+        self.classifier = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, x):
+        """
+        x: (B, C, T)
+        """
+
+        # --- CNN ---
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.dropout(x)
+        # x: (B, F, T')
+
+        # --- (B, T', F) ---
+        x = x.permute(0, 2, 1)
+
+        # --- Positional encoding ---
+        x = self.pos(x)
+
+        # --- CLS token ---
+        B = x.size(0)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+
+        # --- Transformer ---
+        h = self.transformer(x)
+        context = h[:, 0]  # CLS
+
+        logits = self.classifier(context)
+        return logits, context, context
